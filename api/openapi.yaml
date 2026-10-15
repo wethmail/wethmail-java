@@ -1,0 +1,1065 @@
+openapi: 3.0.3
+info:
+  description: |
+    API transaccional de envio de email. Aceita um pedido de envio, valida-o, enfileira-o e devolve um `id` com que se segue o estado até `sent` ou `bounced`. Requer autenticação com API key em todos os endpoints exceto `/healthz` e `/v1/webhooks/bounce` (que usa o header `X-Webhook-Secret`).
+  title: WethMail API
+  version: 1.0.0
+externalDocs:
+  description: Guia de implementação e operação
+  url: ../guide/execution-guide.md
+servers:
+- description: Desenvolvimento local (a porta do host é configurável com APP_PORT)
+  url: http://localhost:8080
+- description: Produção (terminar TLS em frente da API)
+  url: https://api.wethmail.example.com
+security:
+- BearerAuth: []
+tags:
+- description: Criação e consulta de emails.
+  name: Emails
+- description: Gestão de domínios de envio e verificação DNS (SPF/DKIM/DMARC).
+  name: Domains
+- description: Agregados por estado e profundidade da fila.
+  name: Stats
+- description: Webhook de notificação de devoluções (bounce).
+  name: Bounces
+- description: Healthcheck e métricas.
+  name: Operational
+paths:
+  /healthz:
+    get:
+      responses:
+        "200":
+          content:
+            application/json:
+              example:
+                status: ok
+                checks:
+                  postgres: ok
+                  redis: ok
+              schema:
+                $ref: '#/components/schemas/Health'
+          description: Todos os serviços respondem.
+        "503":
+          content:
+            application/json:
+              example:
+                status: degradado
+                checks:
+                  postgres: ok
+                  redis: unavailable
+              schema:
+                $ref: '#/components/schemas/Health'
+          description: Pelo menos um serviço indisponível.
+      security: []
+      summary: Healthcheck de Postgres e Redis
+      tags:
+      - Operational
+      x-accepts:
+      - application/json
+  /metrics:
+    get:
+      description: |
+        Contadores de emails recebidos/enviados/falhados/devolvidos, profundidade da fila e histograma de latência de entrega. Protegido pela mesma API key.
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                example: |
+                  wethmail_emails_received_total 42
+                  wethmail_emails_sent_total 40
+                  wethmail_queue_pending{queue="emails"} 0
+                type: string
+          description: Métricas em texto (formato Prometheus).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+      summary: Métricas no formato de exposição Prometheus (texto)
+      tags:
+      - Operational
+      x-accepts:
+      - application/json
+      - text/plain
+  /v1/emails:
+    post:
+      operationId: createEmail
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEmailRequest'
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              example:
+                id: 1d2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b
+                status: queued
+              schema:
+                $ref: '#/components/schemas/EmailCreated'
+          description: Email aceite e enfileirado.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "422":
+          content:
+            application/json:
+              example:
+                erro: "from inválido: endereço de email inválido"
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: |
+            Payload válido mas semanticamente inválido — endereço malformado, campos obrigatórios em falta ou domínio de envio não verificado (quando DOMAIN_ENFORCE_VERIFIED=true).
+        "429":
+          content:
+            application/json:
+              example:
+                erro: demasiados pedidos
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Excedido o rate limit (RATE_LIMIT_RPS x RATE_LIMIT_BURST).
+          headers:
+            Retry-After:
+              explode: false
+              schema:
+                example: 1
+                type: integer
+              style: simple
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Cria um email e enfileira-o para entrega
+      tags:
+      - Emails
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /v1/emails/{id}:
+    get:
+      operationId: getEmail
+      parameters:
+      - description: UUID do email (devolvido em POST /v1/emails).
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          format: uuid
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Email'
+          description: Estado do email. Acesso limitado ao dono da chave.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Recurso inexistente (ou fora do alcance da conta).
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Devolve o estado atual de um email
+      tags:
+      - Emails
+      x-accepts:
+      - application/json
+  /v1/domains:
+    get:
+      operationId: listDomains
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/Domain'
+                type: array
+          description: Lista de domínios da conta.
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Lista os domínios do dono autenticado
+      tags:
+      - Domains
+      x-accepts:
+      - application/json
+    post:
+      operationId: createDomain
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/createDomain_request'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+          description: Domínio registado com os registos DNS a publicar.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Domínio já registado (único entre todas as contas).
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Nome de domínio não passa na validação.
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Regista um domínio de envio e gera o par de chaves DKIM
+      tags:
+      - Domains
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /v1/domains/{id}:
+    delete:
+      operationId: deleteDomain
+      parameters:
+      - description: UUID do domínio.
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          format: uuid
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Domínio removido.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Recurso inexistente (ou fora do alcance da conta).
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Remove um domínio (apenas do dono autenticado)
+      tags:
+      - Domains
+      x-accepts:
+      - application/json
+    get:
+      operationId: getDomain
+      parameters:
+      - description: UUID do domínio.
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          format: uuid
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+          description: Domínio solicitado.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Recurso inexistente (ou fora do alcance da conta).
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Devolve um domínio (apenas do dono autenticado)
+      tags:
+      - Domains
+      x-accepts:
+      - application/json
+  /v1/domains/{id}/verify:
+    post:
+      description: |
+        Consulta os registos TXT publicados (DKIM, SPF e DMARC) e atualiza o estado `verified` quando o registo DKIM coincide com a chave pública armazenada.
+      operationId: verifyDomain
+      parameters:
+      - description: UUID do domínio.
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          format: uuid
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainVerifyResponse'
+          description: Resultado da verificação.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Recurso inexistente (ou fora do alcance da conta).
+        "502":
+          content:
+            application/json:
+              example:
+                erro: dns lookup failed
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Falha de lookup DNS.
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Verifica a propagação dos registos DNS de um domínio
+      tags:
+      - Domains
+      x-accepts:
+      - application/json
+  /v1/stats:
+    get:
+      description: |
+        Janela de 24h por omissão; usa `?since=<RFC3339>` para a alargar ou encurtar. Apenas emails do dono autenticado.
+      operationId: getStats
+      parameters:
+      - description: Início da janela em formato RFC3339.
+        explode: true
+        in: query
+        name: since
+        required: false
+        schema:
+          example: 2026-10-10T00:00:00Z
+          format: date-time
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+          description: Contagens do período.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Parâmetro `since` inválido.
+        "401":
+          content:
+            application/json:
+              example:
+                erro: não autorizado
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Chave de API ausente ou inválida.
+          headers:
+            WWW-Authenticate:
+              description: Convidar à autenticação Bearer.
+              explode: false
+              schema:
+                type: string
+              style: simple
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security:
+      - BearerAuth: []
+      summary: Agregado de emails por estado e profundidade da fila
+      tags:
+      - Stats
+      x-accepts:
+      - application/json
+  /v1/webhooks/bounce:
+    post:
+      description: |
+        Não usa a API key; autentica com o header `X-Webhook-Secret`. Se o endpoint estiver desativado (WEBHOOK_SECRET vazio) responde 503. Aceita o formato configurado em BOUNCE_PROVIDER: auto, generic, postmark, ses, mailgun ou dsn.
+      operationId: bounceWebhook
+      parameters:
+      - description: Segredo partilhado; a ausência responde 401.
+        explode: false
+        in: header
+        name: X-Webhook-Secret
+        required: true
+        schema:
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              description: Payload do provedor (formato varia com BOUNCE_PROVIDER).
+              example:
+                message_id: <d6e2f3a4-...@wethmail.local>
+                recipient: inexistente@example.com
+                reason: 550 5.1.1 User unknown
+                type: hard
+              type: object
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              example:
+                received: 1
+                processed: 1
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: Notificação interpretada e processada.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Corpo ou notificação inválida.
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Segredo webhook incorreto ou ausente.
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Webhook desativado (WEBHOOK_SECRET não configurado).
+        "429":
+          content:
+            application/json:
+              example:
+                erro: demasiados pedidos
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Excedido o rate limit (RATE_LIMIT_RPS x RATE_LIMIT_BURST).
+          headers:
+            Retry-After:
+              explode: false
+              schema:
+                example: 1
+                type: integer
+              style: simple
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Erro interno (detalhes apenas em logs).
+      security: []
+      summary: Recebe uma notificação de bounce (provedor ou DSN)
+      tags:
+      - Bounces
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+components:
+  parameters:
+    EmailId:
+      description: UUID do email (devolvido em POST /v1/emails).
+      explode: false
+      in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+      style: simple
+    DomainId:
+      description: UUID do domínio.
+      explode: false
+      in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+      style: simple
+  responses:
+    Unauthorized:
+      content:
+        application/json:
+          example:
+            erro: não autorizado
+          schema:
+            $ref: '#/components/schemas/Error'
+      description: Chave de API ausente ou inválida.
+      headers:
+        WWW-Authenticate:
+          description: Convidar à autenticação Bearer.
+          explode: false
+          schema:
+            type: string
+          style: simple
+    BadRequest:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      description: Requisição malformada (JSON inválido ou parâmetro incorreto).
+    NotFound:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      description: Recurso inexistente (ou fora do alcance da conta).
+    RateLimited:
+      content:
+        application/json:
+          example:
+            erro: demasiados pedidos
+          schema:
+            $ref: '#/components/schemas/Error'
+      description: Excedido o rate limit (RATE_LIMIT_RPS x RATE_LIMIT_BURST).
+      headers:
+        Retry-After:
+          explode: false
+          schema:
+            example: 1
+            type: integer
+          style: simple
+    InternalError:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      description: Erro interno (detalhes apenas em logs).
+  schemas:
+    Error:
+      example:
+        erro: payload inválido
+      properties:
+        erro:
+          description: Mensagem de erro (genérica; detalhes nos logs).
+          type: string
+      required:
+      - erro
+      type: object
+    EmailStatus:
+      description: |
+        Ciclo de vida: pending → queued → sending → sent; erro transitório devolve a queued para retry; falha definitiva → failed; bounce → bounced.
+      enum:
+      - pending
+      - queued
+      - sending
+      - sent
+      - failed
+      - bounced
+      type: string
+    CreateEmailRequest:
+      example:
+        from: no-reply@mail.example.com
+        to: cliente@example.com
+        subject: Confirma o teu endereço
+        body: "Olá, clica no link para confirmares o teu email."
+      properties:
+        from:
+          description: Endereço de origem (em produção deve ser de um domínio verificado).
+          example: no-reply@mail.example.com
+          format: email
+          type: string
+        to:
+          description: Destinatário único.
+          example: cliente@example.com
+          format: email
+          type: string
+        subject:
+          example: Olá! Confirma o teu endereço de email
+          maxLength: 998
+          type: string
+        body:
+          description: Corpo em texto simples.
+          example: "Olá, clica no link para confirmares o teu email."
+          maxLength: 1048576
+          type: string
+      required:
+      - body
+      - from
+      - subject
+      - to
+      type: object
+    EmailCreated:
+      example:
+        id: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        status: pending
+      properties:
+        id:
+          format: uuid
+          type: string
+        status:
+          $ref: '#/components/schemas/EmailStatus'
+      required:
+      - id
+      - status
+      type: object
+    Email:
+      example:
+        id: 1d2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b
+        from: no-reply@mail.example.com
+        to: cliente@example.com
+        subject: Confirma o teu endereço
+        body: "Olá, clica no link para confirmares o teu email."
+        status: sent
+        attempts: 1
+        message_id: <cb4b2fdc-8e11-4d3f-9b7a-1c2d3e4f5a6b@wethmail.local>
+        created_at: 2026-10-11T09:30:00Z
+        updated_at: 2026-10-11T09:30:01Z
+      properties:
+        id:
+          format: uuid
+          type: string
+        owner:
+          description: Dono (tenant) a que pertence o email; só aparece no modelo
+            interno.
+          type: string
+        from:
+          format: email
+          type: string
+        to:
+          format: email
+          type: string
+        subject:
+          type: string
+        body:
+          type: string
+        status:
+          $ref: '#/components/schemas/EmailStatus'
+        attempts:
+          description: Tentativas de entrega já realizadas.
+          format: int32
+          type: integer
+        message_id:
+          description: Message-ID SMTP definido quando a entrega é aceite.
+          nullable: true
+          type: string
+        created_at:
+          format: date-time
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      type: object
+    DNSRecord:
+      properties:
+        type:
+          example: TXT
+          type: string
+        name:
+          description: Nome completo do registo a publicar.
+          type: string
+        value:
+          description: Valor a publicar.
+          type: string
+      required:
+      - name
+      - type
+      - value
+      type: object
+    Domain:
+      example:
+        id: 9a8b7c6d-1e2f-4a3b-8c7d-6e5f4a3b2c1d
+        domain: mail.example.com
+        owner: api
+        verified: false
+        dkim_selector: wethmail
+        dns_records:
+        - type: TXT
+          name: mail.example.com
+          value: v=spf1 a mx -all
+        - type: TXT
+          name: wethmail._domainkey.mail.example.com
+          value: v=DKIM1; k=rsa; p=MIIBIjAN...
+        - type: TXT
+          name: _dmarc.mail.example.com
+          value: v=DMARC1; p=none; rua=mailto:dmarc@mail.example.com
+        created_at: 2026-10-11T09:00:00Z
+        updated_at: 2026-10-11T09:00:00Z
+      properties:
+        id:
+          format: uuid
+          type: string
+        domain:
+          example: mail.example.com
+          type: string
+        owner:
+          type: string
+        verified:
+          description: Verdadeiro quando o registo DKIM coincide com a chave pública.
+          type: boolean
+        dkim_selector:
+          example: wethmail
+          type: string
+        dns_records:
+          description: "Registos (SPF, DKIM e DMARC) a publicar no DNS do domínio."
+          items:
+            $ref: '#/components/schemas/DNSRecord'
+          type: array
+        verified_at:
+          format: date-time
+          nullable: true
+          type: string
+        created_at:
+          format: date-time
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      type: object
+    RecordStatus:
+      example:
+        type: TXT
+        name: wethmail._domainkey.mail.example.com
+        expected: v=DKIM1; k=rsa; p=MIIBIjAN...
+        found: true
+        actual: v=DKIM1; k=rsa; p=MIIBIjAN...
+      properties:
+        type:
+          example: TXT
+          type: string
+        name:
+          type: string
+        expected:
+          description: Valor esperado.
+          type: string
+        found:
+          description: "Registro encontrado (e, no caso DKIM, coincidente)."
+          type: boolean
+        actual:
+          description: Valores realmente encontrados no DNS (apenas quando há).
+          type: string
+      type: object
+    DomainVerifyResponse:
+      example:
+        records:
+        - type: TXT
+          name: wethmail._domainkey.mail.example.com
+          expected: v=DKIM1; k=rsa; p=MIIBIjAN...
+          found: true
+          actual: v=DKIM1; k=rsa; p=MIIBIjAN...
+        - type: TXT
+          name: wethmail._domainkey.mail.example.com
+          expected: v=DKIM1; k=rsa; p=MIIBIjAN...
+          found: true
+          actual: v=DKIM1; k=rsa; p=MIIBIjAN...
+        domain:
+          id: 9a8b7c6d-1e2f-4a3b-8c7d-6e5f4a3b2c1d
+          domain: mail.example.com
+          owner: api
+          verified: false
+          dkim_selector: wethmail
+          dns_records:
+          - type: TXT
+            name: mail.example.com
+            value: v=spf1 a mx -all
+          - type: TXT
+            name: wethmail._domainkey.mail.example.com
+            value: v=DKIM1; k=rsa; p=MIIBIjAN...
+          - type: TXT
+            name: _dmarc.mail.example.com
+            value: v=DMARC1; p=none; rua=mailto:dmarc@mail.example.com
+          created_at: 2026-10-11T09:00:00Z
+          updated_at: 2026-10-11T09:00:00Z
+        verified: true
+      properties:
+        domain:
+          $ref: '#/components/schemas/Domain'
+        verified:
+          type: boolean
+        records:
+          items:
+            $ref: '#/components/schemas/RecordStatus'
+          type: array
+      type: object
+    Stats:
+      example:
+        total: 0
+        generated_at: 2000-01-23T04:56:07.000+00:00
+        counts:
+          pending: 0
+          queued: 0
+          sending: 0
+          sent: 40
+          failed: 2
+          bounced: 0
+        queue_pending: 6
+        since: 2000-01-23T04:56:07.000+00:00
+      properties:
+        generated_at:
+          format: date-time
+          type: string
+        since:
+          description: Início da janela considerada.
+          format: date-time
+          type: string
+        counts:
+          additionalProperties:
+            format: int64
+            type: integer
+          description: Contagem de emails por estado no período.
+          example:
+            pending: 0
+            queued: 0
+            sending: 0
+            sent: 40
+            failed: 2
+            bounced: 0
+          type: object
+        total:
+          format: int64
+          type: integer
+        queue_pending:
+          description: Jobs pendentes na fila (0 quando a fila não responde).
+          format: int64
+          type: integer
+      type: object
+    WebhookResponse:
+      example:
+        processed: 6
+        received: 0
+      properties:
+        received:
+          description: Notificações interpretadas no payload.
+          type: integer
+        processed:
+          description: Notificações associadas a um email e processadas.
+          type: integer
+      type: object
+    Health:
+      example:
+        checks:
+          key: ok
+        status: ok
+      properties:
+        status:
+          enum:
+          - ok
+          - degradado
+          type: string
+        checks:
+          additionalProperties:
+            enum:
+            - ok
+            - unavailable
+            type: string
+          type: object
+      type: object
+    createDomain_request:
+      properties:
+        domain:
+          description: Domínio totalmente qualificado (ex. mail.example.com).
+          example: mail.example.com
+          type: string
+      required:
+      - domain
+      type: object
+  securitySchemes:
+    BearerAuth:
+      description: |
+        Chave de API no formato `wm_test_<id-hex>_<segredo-hex>` (ou `wm_live_...`), gerada com `go run ./cmd/api-keygen`.
+      scheme: bearer
+      type: http
+
